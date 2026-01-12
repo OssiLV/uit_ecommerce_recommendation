@@ -110,9 +110,11 @@ services:
   # ECOMMERCE BACKEND - Spring Boot
   # ============================================
   ecommerce-backend:
+    # image: ossilv/uit-ecommerce:latest
     build:
       context: ./uit_ecommerce
       dockerfile: Dockerfile
+    #
     container_name: ecommerce-backend
     ports:
       - "8080:8080"
