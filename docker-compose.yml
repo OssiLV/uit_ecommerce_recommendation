@@ -1,0 +1,149 @@
+services:
+  # ============================================
+  # DATABASE SERVICES
+  # ============================================
+  postgres:
+    # Sử dụng pgvector image (hỗ trợ vector store cho AI chatbot)
+    image: pgvector/pgvector:pg16
+    container_name: ecommerce-postgres
+    environment:
+      POSTGRES_DB: ecommerce
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: 123456
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ecommerce-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: ecommerce-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ecommerce-network
+
+  elasticsearch:
+    image: elasticsearch:7.17.10
+    container_name: ecommerce-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms256m -Xmx512m"
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    mem_limit: 1g
+    memswap_limit: 1g
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - ecommerce-network
+
+  # ============================================
+  # ML MODEL TRAINING - Python
+  # ============================================
+  model-trainer:
+    build:
+      context: ./recommender_system
+      dockerfile: Dockerfile
+    container_name: recommender-trainer
+    volumes:
+      - ./recommender_system/saved_models:/app/saved_models
+    environment:
+      - JAVA_API_URL=http://ecommerce-backend:8080/api/v1/admin/interactions/export
+    depends_on:
+      ecommerce-backend:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+
+  # ============================================
+  # ML SERVICE - TensorFlow Serving
+  # ============================================
+  tf-serving:
+    image: tensorflow/serving:latest
+    container_name: recommender-serving
+    ports:
+      - "8501:8501" # REST API
+      - "8500:8500" # gRPC API
+    volumes:
+      - ./recommender_system/saved_models:/models
+    environment:
+      - MODEL_NAME=recommender
+    command: >
+      --model_config_file=/models/models.config --model_config_file_poll_wait_seconds=60 --allow_version_labels_for_unavailable_models=true
+    restart: unless-stopped
+    depends_on:
+      model-trainer:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8501/v1/models/recommender" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - ecommerce-network
+
+  # ============================================
+  # ECOMMERCE BACKEND - Spring Boot
+  # ============================================
+  ecommerce-backend:
+    build:
+      context: ./uit_ecommerce
+      dockerfile: Dockerfile
+    container_name: ecommerce-backend
+    ports:
+      - "8080:8080"
+    environment:
+      # Kích hoạt profile docker - sử dụng application-docker.properties
+      SPRING_PROFILES_ACTIVE: docker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8080/api/v1/auth/health || exit 1" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - ecommerce-network
+
+# ============================================
+# NETWORKS & VOLUMES
+# ============================================
+networks:
+  ecommerce-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  elasticsearch_data:
