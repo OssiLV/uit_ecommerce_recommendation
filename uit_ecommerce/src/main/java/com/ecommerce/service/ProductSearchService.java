@@ -7,6 +7,9 @@ import com.ecommerce.elasticsearch.repository.ProductElasticsearchRepository;
 import com.ecommerce.entity.Product;
 import com.ecommerce.mapper.ProductMapper;
 import com.ecommerce.repository.ProductRepository;
+
+import co.elastic.clients.elasticsearch._types.query_dsl.Query;
+
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.cache.annotation.CacheEvict;
@@ -14,10 +17,10 @@ import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.elasticsearch.client.elc.NativeQueryBuilder;
 import org.springframework.data.elasticsearch.core.ElasticsearchOperations;
 import org.springframework.data.elasticsearch.core.SearchHits;
-import org.springframework.data.elasticsearch.core.query.Criteria;
-import org.springframework.data.elasticsearch.core.query.CriteriaQuery;
+
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -43,45 +46,46 @@ public class ProductSearchService {
     public Page<ProductResponse> search(ProductSearchCriteria criteria, Pageable pageable) {
         log.info("Searching products with Elasticsearch: {}", criteria);
 
-        // Build dynamic criteria query - start with match_all logic
-        Criteria esCriteria = null;
+        // 1. Build Bool Query for filtering and matching
 
-        // Keyword search on name/description
-        if (criteria.keyword() != null && !criteria.keyword().isEmpty()) {
-            String keyword = criteria.keyword().toLowerCase();
-            esCriteria = new Criteria("name").matches(keyword)
-                    .or(new Criteria("description").matches(keyword));
-        }
+        Query boolQuery = Query.of(q -> q.bool(b -> {
 
-        // Category filter
-        if (criteria.categoryId() != null) {
-            Criteria categoryCriteria = new Criteria("categoryId").is(criteria.categoryId());
-            esCriteria = (esCriteria == null) ? categoryCriteria : esCriteria.and(categoryCriteria);
-        }
+            // A. Keyword Search with Boosting (Name^3, Description^1)
+            if (criteria.keyword() != null && !criteria.keyword().isEmpty()) {
+                b.must(m -> m.multiMatch(mm -> mm
+                        .query(criteria.keyword())
+                        .fields(List.of("name^3", "description")) // Boost name 3x
+                        .fuzziness("AUTO") // Optional: Fuzzy search
+                ));
+            } else {
+                b.must(m -> m.matchAll(ma -> ma));
+            }
 
-        // Min price filter
-        if (criteria.minPrice() != null) {
-            Criteria minPriceCriteria = new Criteria("basePrice").greaterThanEqual(criteria.minPrice().doubleValue());
-            esCriteria = (esCriteria == null) ? minPriceCriteria : esCriteria.and(minPriceCriteria);
-        }
+            // B. Filters
+            if (criteria.categoryId() != null) {
+                b.filter(f -> f.term(t -> t.field("categoryId").value(criteria.categoryId())));
+            }
+            if (criteria.minPrice() != null) {
+                b.filter(f -> f.range(r -> r.number(n -> n.field("basePrice")
+                        .gte(criteria.minPrice().doubleValue()))));
+            }
+            if (criteria.maxPrice() != null) {
+                b.filter(f -> f.range(r -> r.number(n -> n.field("basePrice")
+                        .lte(criteria.maxPrice().doubleValue()))));
+            }
+            return b;
+        }));
 
-        // Max price filter
-        if (criteria.maxPrice() != null) {
-            Criteria maxPriceCriteria = new Criteria("basePrice").lessThanEqual(criteria.maxPrice().doubleValue());
-            esCriteria = (esCriteria == null) ? maxPriceCriteria : esCriteria.and(maxPriceCriteria);
-        }
+        // 2. Execute Query
+        var query = new NativeQueryBuilder()
+                .withQuery(boolQuery)
+                .withPageable(pageable)
+                .build();
 
-        // If no criteria, match all
-        if (esCriteria == null) {
-            esCriteria = new Criteria();
-        }
-
-        CriteriaQuery query = new CriteriaQuery(esCriteria, pageable);
         SearchHits<ProductDocument> searchHits = elasticsearchOperations.search(query, ProductDocument.class);
 
         log.info("Elasticsearch returned {} hits", searchHits.getTotalHits());
 
-        // Lấy product entities từ database để có đầy đủ thông tin (images, variants)
         List<Long> productIds = searchHits.getSearchHits().stream()
                 .map(hit -> hit.getContent().getId())
                 .collect(Collectors.toList());
@@ -90,8 +94,19 @@ public class ProductSearchService {
             return new PageImpl<>(List.of(), pageable, 0);
         }
 
+        // Fetch full entities (preserve order from Elasticsearch hits)
+        // Note: findAllById does not guarantee order, so we might need to re-sort or
+        // map manually if strict order needed.
+        // For now, strict order preservation logic:
         List<Product> products = productRepository.findAllById(productIds);
-        List<ProductResponse> responses = products.stream()
+
+        // Sort products list based on productIds order (relevance order)
+        java.util.Map<Long, Product> productMap = products.stream()
+                .collect(Collectors.toMap(Product::getId, p -> p));
+
+        List<ProductResponse> responses = productIds.stream()
+                .filter(productMap::containsKey)
+                .map(productMap::get)
                 .map(ProductMapper::toProductResponse)
                 .collect(Collectors.toList());
 
